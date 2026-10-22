@@ -1424,19 +1424,32 @@ export function getMemoryInventory(): {
 // turn. We snapshot the memory context at deliberate checkpoints
 // (session_start, session_before_compact, long_term writes, day rollover) and
 // emit the same bytes for every turn in between.
+//
+// The snapshot belongs to one extension instance, i.e. one pi session. pi
+// loads this module once per cwd and calls the factory for every session of
+// that project in the same process (pi-web runs many), so module-level state
+// would let one session's session_start rewrite the bytes another session has
+// already cached with its provider.
 // ---------------------------------------------------------------------------
 
-let memorySnapshot: string | null = null;
-let snapshotTakenAt: string | null = null;
-let snapshotTakenOnDate: string | null = null;
-let snapshotReason: string | null = null;
-let snapshotDirty = false;
-function refreshMemorySnapshot(reason: string) {
-	memorySnapshot = buildMemoryContext("");
-	snapshotTakenAt = nowTimestamp();
-	snapshotTakenOnDate = todayStr();
-	snapshotReason = reason;
-	snapshotDirty = false;
+interface MemorySnapshot {
+	text: string | null;
+	takenAt: string | null;
+	takenOnDate: string | null;
+	reason: string | null;
+	dirty: boolean;
+}
+
+function createMemorySnapshot(): MemorySnapshot {
+	return { text: null, takenAt: null, takenOnDate: null, reason: null, dirty: false };
+}
+
+function refreshMemorySnapshot(snapshot: MemorySnapshot, reason: string) {
+	snapshot.text = buildMemoryContext("");
+	snapshot.takenAt = nowTimestamp();
+	snapshot.takenOnDate = todayStr();
+	snapshot.reason = reason;
+	snapshot.dirty = false;
 }
 
 function getSnapshotMode(): "stable" | "refresh" | "per-turn" {
@@ -1446,13 +1459,17 @@ function getSnapshotMode(): "stable" | "refresh" | "per-turn" {
 	return "stable";
 }
 
-/** Reset snapshot state (for testing). */
-export function _resetMemorySnapshot() {
-	memorySnapshot = null;
-	snapshotTakenAt = null;
-	snapshotTakenOnDate = null;
-	snapshotReason = null;
-	snapshotDirty = false;
+/** Name of the structured system-prompt section that carries the memory block. */
+const MEMORY_SECTION = "pi_memory";
+
+/**
+ * The structured prompt sections pi exposes to `before_agent_start`, or
+ * undefined on a host that predates them (the caller then falls back to
+ * replacing the whole system prompt).
+ */
+function getPromptSections(event: unknown): Record<string, string> | undefined {
+	const sections = (event as { systemPromptOptions?: { sections?: unknown } }).systemPromptOptions?.sections;
+	return sections && typeof sections === "object" ? (sections as Record<string, string>) : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1477,9 @@ export function _resetMemorySnapshot() {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Per-session snapshot state; see the note above createMemorySnapshot().
+	const snapshot = createMemorySnapshot();
+
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
 		exitSummaryReason = null;
@@ -1482,7 +1502,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(qmdInstallInstructions(), "info");
 			}
-			refreshMemorySnapshot("session_start");
+			refreshMemorySnapshot(snapshot, "session_start");
 			return;
 		}
 
@@ -1494,7 +1514,7 @@ export default function (pi: ExtensionAPI) {
 		// embedding) and fresh installs where the collection exists but was
 		// never embedded. Incremental, so a no-op when already current.
 		ensureQmdEmbed();
-		refreshMemorySnapshot("session_start");
+		refreshMemorySnapshot(snapshot, "session_start");
 	});
 
 	// --- session_shutdown: write exit summary + clean up timer ---
@@ -1594,19 +1614,19 @@ export default function (pi: ExtensionAPI) {
 			// memory_read / memory_search reach the files directly. "refresh" restores the old
 			// checkpoint behaviour.
 			const today = todayStr();
-			const stale = mode === "refresh" && (snapshotDirty || snapshotTakenOnDate !== today);
-			if (memorySnapshot === null || stale) {
+			const stale = mode === "refresh" && (snapshot.dirty || snapshot.takenOnDate !== today);
+			if (snapshot.text === null || stale) {
 				const reason =
-					memorySnapshot === null ? "before_agent_start" : snapshotDirty ? "long_term_write" : "day_rollover";
-				refreshMemorySnapshot(reason);
+					snapshot.text === null ? "before_agent_start" : snapshot.dirty ? "long_term_write" : "day_rollover";
+				refreshMemorySnapshot(snapshot, reason);
 			}
-			memoryContext = memorySnapshot ?? "";
+			memoryContext = snapshot.text ?? "";
 			// Deliberately carries no timestamp and no reason word: both change
 			// between turns without the memory itself changing, which is enough on
 			// its own to invalidate the cache this branch is trying to preserve.
 			snapshotCaveat =
 				mode === "refresh"
-					? `Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
+					? `Snapshot ${snapshot.reason} at ${snapshot.takenAt}. ` +
 						"Use memory_read / memory_search for the authoritative latest state; " +
 						"recent writes may also be visible in tool-call history."
 					: "Loaded once at session start and not re-read since. Use memory_read / memory_search " +
@@ -1615,7 +1635,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!memoryContext) return;
 
-		const headerLines = ["\n\n## Memory"];
+		const headerLines = ["## Memory"];
 		if (snapshotCaveat) headerLines.push(`(${snapshotCaveat})`);
 		headerLines.push(
 			"The following memory files have been loaded. Use the memory_write tool to persist important information.",
@@ -1628,10 +1648,21 @@ export default function (pi: ExtensionAPI) {
 			"",
 			memoryContext,
 		);
+		const block = headerLines.join("\n");
 
-		return {
-			systemPrompt: event.systemPrompt + headerLines.join("\n"),
-		};
+		// A structured section lets pi diff the prompt: when the block changes it
+		// appends a small delta instead of rewriting the cached prefix. Returning
+		// systemPrompt replaces the whole prompt with one opaque string, so a change
+		// anywhere in it (another extension's section, a refreshed snapshot) voids
+		// the whole conversation's prefix cache. pi drops a section the handler does
+		// not set again, so it is set on every run. per-turn mode rebuilds the block
+		// each turn by design and keeps the old replacement behavior.
+		const sections = mode === "per-turn" ? undefined : getPromptSections(event);
+		if (sections) {
+			sections[MEMORY_SECTION] = block;
+			return;
+		}
+		return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
 	});
 
 	// --- Pre-compaction: auto-capture session handoff ---
@@ -1678,7 +1709,7 @@ export default function (pi: ExtensionAPI) {
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 		} finally {
-			refreshMemorySnapshot("session_before_compact");
+			refreshMemorySnapshot(snapshot, "session_before_compact");
 		}
 	});
 
@@ -1761,7 +1792,7 @@ export default function (pi: ExtensionAPI) {
 			// should always see. Mark snapshot dirty so the next turn refreshes.
 			// Daily writes are high-frequency and already echoed via tool-call
 			// args — they are intentionally NOT marked dirty.
-			snapshotDirty = true;
+			snapshot.dirty = true;
 
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
@@ -2169,7 +2200,7 @@ export default function (pi: ExtensionAPI) {
 			// so deleted content disappears from authoritative context without being
 			// copied into persisted correction messages. This intentionally spends one
 			// cache invalidation on an explicit deletion.
-			refreshMemorySnapshot("memory_forget");
+			refreshMemorySnapshot(snapshot, "memory_forget");
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 
@@ -2239,7 +2270,7 @@ export default function (pi: ExtensionAPI) {
 				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
 				// Restore changes which durable facts are authoritative, so refresh the
 				// snapshot instead of persisting restored content in a correction message.
-				refreshMemorySnapshot("memory_restore");
+				refreshMemorySnapshot(snapshot, "memory_restore");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 			}

@@ -6,6 +6,24 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The memory snapshot is now per extension instance instead of module state.
+  pi loads the extension once per cwd and reuses it for every session of that
+  project in the process, so one session's `session_start` re-read the files and
+  changed the system prompt another session had already cached, voiding its
+  prefix cache on the next turn.
+- In `stable` and `refresh` modes the memory block is injected as a `pi_memory`
+  structured system-prompt section when the host provides
+  `systemPromptOptions.sections`, instead of returning a replacement
+  `systemPrompt`. pi can then append a delta for a changed block, and an
+  unrelated section changing no longer rewrites the cached prefix. Hosts
+  without sections, and `per-turn` mode, keep the replacement behavior. (#50)
+
+### Removed
+
+- The test-only `_resetMemorySnapshot()` export; state is created per instance.
+
 ## [0.4.2] — 2026-08-10
 
 ### Added
