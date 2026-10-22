@@ -128,7 +128,7 @@ Local prefix-caching runtimes (llama.cpp, vLLM, MLX) invalidate from the first d
 
 To keep the prefix byte-stable, the extension snapshots the memory context at deliberate checkpoints and emits the same bytes for every turn in between. Snapshots refresh on:
 
-- **`session_start`** — fresh snapshot per session
+- **`session_start`** — fresh snapshot per session. The snapshot belongs to that session only: another session starting in the same pi process (for example several sessions of one project in pi-web) cannot change it.
 - **`session_before_compact`** — handoff is written then snapshot refreshes (one intentional cache boundary at compaction)
 - **`session_start`** is the only checkpoint in `stable` mode. Long-term writes and day rollovers do **not** re-render the block: a refresh rewrites the tail of the system prompt and voids the prefix cache for the whole conversation, which is the cost the snapshot exists to avoid, paid on the most common in-session event. The written fact is already in tool-call history, and `memory_read` / `memory_search` reach the files directly.
 - **Deletions and restores** intentionally refresh the snapshot. These are rare, authority-changing operations: forgotten content must disappear from the prompt immediately, and pi does not copy deleted content into a persisted correction message merely to preserve the cache.
@@ -136,7 +136,9 @@ To keep the prefix byte-stable, the extension snapshots the memory context at de
 
 `memory_write` with `target: daily` and `scratchpad` writes do **not** mark dirty — they're high-frequency and the write content is already echoed via tool-call args. The model can always call `memory_read` / `memory_search` for the authoritative latest state.
 
-Set `PI_MEMORY_SNAPSHOT=per-turn` to opt out and restore the old per-turn rebuild behavior, including automatic per-prompt qmd search injection.
+When pi exposes structured system-prompt sections (`event.systemPromptOptions.sections`), the block is injected as a `pi_memory` section instead of replacing the whole system prompt, so pi can append a small delta when the block changes and a change in another extension's section no longer voids the cached prefix. On older pi versions the block is appended to the system prompt as before.
+
+Set `PI_MEMORY_SNAPSHOT=per-turn` to opt out and restore the old per-turn rebuild behavior, including automatic per-prompt qmd search injection (this mode always replaces the whole system prompt).
 
 ### Selective injection (opt-in via `per-turn` mode)
 

@@ -18,7 +18,6 @@ import {
 	_getUpdateTimer,
 	_resetBaseDir,
 	_resetExecFileForTest,
-	_resetMemorySnapshot,
 	_resetQmdJsResolutionForTest,
 	_setBaseDir,
 	_setExecFileForTest,
@@ -1359,7 +1358,6 @@ describe("lifecycle hooks", () => {
 		setupTmpDir();
 		ensureDirs();
 		_setQmdAvailable(false);
-		_resetMemorySnapshot();
 		const mockPi = createMockPi();
 		hooks = mockPi.hooks;
 		registerExtension(mockPi.pi as any);
@@ -1863,7 +1861,6 @@ describe("KV cache stability: memory snapshot", () => {
 		setupTmpDir();
 		ensureDirs();
 		_setQmdAvailable(false);
-		_resetMemorySnapshot();
 		// Default to stable mode for these tests; per-turn test overrides locally.
 		delete process.env.PI_MEMORY_SNAPSHOT;
 		// Avoid implicit search calls bleeding in.
@@ -2043,7 +2040,7 @@ describe("KV cache stability: memory snapshot", () => {
 		expect(result2.systemPrompt).not.toContain("First content");
 	});
 
-	test("session_start refreshes snapshot (resets module state across sessions)", async () => {
+	test("session_start refreshes this session's snapshot", async () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "session-1 content", "utf-8");
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result1.systemPrompt).toContain("session-1 content");
@@ -2079,6 +2076,95 @@ describe("KV cache stability: memory snapshot", () => {
 		// ...but no clock and no reason word: either would change the bytes
 		// between turns without the memory itself changing.
 		expect(result.systemPrompt).not.toMatch(/\d{2}:\d{2}:\d{2}/);
+	});
+
+	/** A second extension instance, as pi creates one per session inside the same process. */
+	async function startOtherSession(sessionId: string) {
+		const other = createMockPi();
+		registerExtension(other.pi as any);
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(new Error("not available"), "", "");
+		}) as any);
+		try {
+			await other.hooks.session_start(
+				{},
+				{ hasUI: false, sessionManager: { getSessionId: () => sessionId }, ui: { notify: () => {} } },
+			);
+		} finally {
+			_resetExecFileForTest();
+		}
+		return other;
+	}
+
+	test("another session starting in the same process does not change this session's snapshot", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "session-A content", "utf-8");
+		const resultA1 = (await hooks.before_agent_start({ systemPrompt: "base" }, {})) as any;
+		expect(resultA1.systemPrompt).toContain("session-A content");
+
+		// pi-web loads the extension once per cwd and runs every session of that
+		// project against it, so module-level state is shared between sessions.
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "session-B content", "utf-8");
+		const other = await startOtherSession("sessB000");
+		const resultB = (await other.hooks.before_agent_start({ systemPrompt: "base" }, {})) as any;
+		expect(resultB.systemPrompt).toContain("session-B content");
+
+		// Session A keeps the bytes it already has cached with the provider.
+		const resultA2 = (await hooks.before_agent_start({ systemPrompt: "base" }, {})) as any;
+		expect(resultA2.systemPrompt).toBe(resultA1.systemPrompt);
+		expect(resultA2.systemPrompt).not.toContain("session-B content");
+	});
+
+	describe("structured system prompt section", () => {
+		const newEvent = (extra: Record<string, unknown> = {}) => ({
+			systemPrompt: "base",
+			systemPromptOptions: { sections: {} as Record<string, string> },
+			...extra,
+		});
+
+		test("puts the memory block in a pi_memory section instead of replacing the system prompt", async () => {
+			fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "SECTION_FACT", "utf-8");
+			const event = newEvent({ prompt: "q" });
+			const result = (await hooks.before_agent_start(event, {})) as any;
+
+			// Returning systemPrompt makes pi send the whole prompt as an opaque
+			// forced string, so any change anywhere in it rewrites the cached prefix.
+			expect(result?.systemPrompt).toBeUndefined();
+			const section = event.systemPromptOptions.sections.pi_memory;
+			expect(section).toContain("SECTION_FACT");
+			expect(section).toContain("## Memory");
+			expect(section).toBe(section.trimStart());
+		});
+
+		test("re-sets an identical section on every run, including runs without a prompt", async () => {
+			fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "first content", "utf-8");
+			const first = newEvent({ prompt: "one" });
+			await hooks.before_agent_start(first, {});
+
+			fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "SECOND content", "utf-8");
+			// A run started by pi.sendMessage(..., { triggerTurn: true }) has no
+			// prompt, and pi drops any section a handler does not set again.
+			const second = newEvent();
+			await hooks.before_agent_start(second, {});
+
+			expect(second.systemPromptOptions.sections.pi_memory).toBe(first.systemPromptOptions.sections.pi_memory);
+			expect(second.systemPromptOptions.sections.pi_memory).not.toContain("SECOND");
+		});
+
+		test("sets no section and returns nothing when there is no memory", async () => {
+			const event = newEvent();
+			const result = await hooks.before_agent_start(event, {});
+			expect(result).toBeUndefined();
+			expect("pi_memory" in event.systemPromptOptions.sections).toBe(false);
+		});
+
+		test("per-turn mode keeps replacing the whole prompt", async () => {
+			process.env.PI_MEMORY_SNAPSHOT = "per-turn";
+			fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "PER_TURN_FACT", "utf-8");
+			const event = newEvent();
+			const result = (await hooks.before_agent_start(event, {})) as any;
+			expect(result.systemPrompt).toContain("PER_TURN_FACT");
+			expect(event.systemPromptOptions.sections.pi_memory).toBeUndefined();
+		});
 	});
 });
 
